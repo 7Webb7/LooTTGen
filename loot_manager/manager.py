@@ -6,7 +6,7 @@ from pathlib import Path
 
 
 class LootTableManager:
-    """Менеджер лута для D&D: предметы, таблицы, контейнеры и генерация выпадений."""
+
 
     def __init__(self, db_path="data/loot_tables.db"):
         self.db_path = Path(db_path)
@@ -16,8 +16,11 @@ class LootTableManager:
         self.conn = sqlite3.connect(self.db_path)
         self.create_tables()
 
+
+
     def create_tables(self):
         cursor = self.conn.cursor()
+
 
         # Таблица предметов
         cursor.execute('''
@@ -50,6 +53,8 @@ class LootTableManager:
                 chance_percent REAL NOT NULL,
                 quantity_min INTEGER DEFAULT 1,
                 quantity_max INTEGER DEFAULT 1,
+                is_unique BOOLEAN DEFAULT 0,
+                is_mandatory BOOLEAN DEFAULT 0,
                 FOREIGN KEY (table_id) REFERENCES loot_tables (id),
                 FOREIGN KEY (item_id) REFERENCES items (id),
                 FOREIGN KEY (subtable_id) REFERENCES loot_tables (id)
@@ -66,6 +71,22 @@ class LootTableManager:
                 FOREIGN KEY (loot_table_id) REFERENCES loot_tables (id)
             )
         ''')
+
+        self.conn.commit()
+
+        self._migrate_table_entries()
+
+    def _migrate_table_entries(self):
+        cursor = self.conn.cursor()
+
+        cursor.execute("PRAGMA table_info(table_entries)")
+        columns = [col[1] for col in cursor.fetchall()]
+
+        if "is_unique" not in columns:
+            cursor.execute("ALTER TABLE table_entries ADD COLUMN is_unique BOOLEAN DEFAULT 0")
+
+        if "is_mandatory" not in columns:
+            cursor.execute("ALTER TABLE table_entries ADD COLUMN is_mandatory BOOLEAN DEFAULT 0")
 
         self.conn.commit()
 
@@ -98,7 +119,8 @@ class LootTableManager:
         return cursor.lastrowid
 
     def add_entry_to_table(self, table_id, item_id=None, subtable_id=None,
-                           chance_percent=1.0, quantity_min=1, quantity_max=1):
+                           chance_percent=1.0, quantity_min=1, quantity_max=1,
+                           is_unique=False, is_mandatory=False):
         cursor = self.conn.cursor()
 
         # Проверяем, что указан либо предмет, либо подтаблица
@@ -107,19 +129,29 @@ class LootTableManager:
 
         cursor.execute('''
             INSERT INTO table_entries 
-            (table_id, item_id, subtable_id, chance_percent, quantity_min, quantity_max)
-            VALUES (?, ?, ?, ?, ?, ?)
-        ''', (table_id, item_id, subtable_id, chance_percent, quantity_min, quantity_max))
+            (table_id, item_id, subtable_id, chance_percent, quantity_min, quantity_max,
+             is_unique, is_mandatory)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            table_id,
+            item_id,
+            subtable_id,
+            chance_percent,
+            quantity_min,
+            quantity_max,
+            1 if is_unique else 0,
+            1 if is_mandatory else 0
+        ))
         self.conn.commit()
         return cursor.lastrowid
 
     def generate_from_table(self, table_id, rolls=1, min_items=1, max_items=1):
         cursor = self.conn.cursor()
 
-        # Получаем все записи таблицы
         cursor.execute('''
-            SELECT te.id, te.item_id, te.subtable_id, te.chance_percent, 
+            SELECT te.id, te.item_id, te.subtable_id, te.chance_percent,
                    te.quantity_min, te.quantity_max,
+                   te.is_unique, te.is_mandatory,
                    i.name as item_name, lt.name as table_name
             FROM table_entries te
             LEFT JOIN items i ON te.item_id = i.id
@@ -133,28 +165,85 @@ class LootTableManager:
 
         loot_results = []
 
-        for roll in range(rolls):
-            # Для каждого броска сначала выбираем случайное количество предметов
-            num_items = random.randint(min_items, max_items)
-            candidates = []
+        for _ in range(rolls):
 
+            mandatory_entries = []
+            unique_entries = []
+            normal_entries = []
+
+            # Разделяем по типам
             for entry in entries:
-                entry_id, item_id, subtable_id, chance_percent, qty_min, qty_max, item_name, table_name = entry
+                (
+                    entry_id, item_id, subtable_id, chance_percent,
+                    qty_min, qty_max, is_unique, is_mandatory,
+                    item_name, table_name
+                ) = entry
 
-                if random.random() * 100 <= chance_percent:
-                    quantity = random.randint(qty_min, qty_max) if qty_max > qty_min else qty_min
+                entry_data = {
+                    "item_id": item_id,
+                    "subtable_id": subtable_id,
+                    "chance_percent": chance_percent,
+                    "qty_min": qty_min,
+                    "qty_max": qty_max,
+                    "item_name": item_name,
+                    "table_name": table_name
+                }
 
-                    if item_id and item_name:
-                        for _ in range(quantity):
-                            candidates.append(item_name)
-                    elif subtable_id and table_name:
-                        sub_loot = self.generate_from_table(subtable_id, 1, min_items=1, max_items=1)
-                        for _ in range(quantity):
-                            candidates.extend(sub_loot)
+                if is_mandatory:
+                    mandatory_entries.append(entry_data)
+                elif is_unique:
+                    unique_entries.append(entry_data)
+                else:
+                    normal_entries.append(entry_data)
 
-            # Выбираем случайные предметы из кандидатов с учётом лимитов
-            if candidates:
-                loot_results.extend(random.sample(candidates, min(num_items, len(candidates))))
+            roll_loot = []
+
+            # ---- 1. Обязательные ----
+            for entry in mandatory_entries:
+                quantity = random.randint(entry["qty_min"], entry["qty_max"])
+                roll_loot.extend(
+                    self._resolve_entry(entry, quantity)
+                )
+
+            # ---- 2. Уникальные ----
+            successful_unique = []
+
+            for entry in unique_entries:
+                if random.random() * 100 <= entry["chance_percent"]:
+                    successful_unique.append(entry)
+
+            if successful_unique:
+                chosen = random.choice(successful_unique)
+                quantity = random.randint(chosen["qty_min"], chosen["qty_max"])
+                roll_loot.extend(
+                    self._resolve_entry(chosen, quantity)
+                )
+
+            # ---- 3. Обычные ----
+            successful_normals = []
+
+            for entry in normal_entries:
+                if random.random() * 100 <= entry["chance_percent"]:
+                    quantity = random.randint(entry["qty_min"], entry["qty_max"])
+                    successful_normals.append(
+                        (entry, quantity)
+                    )
+
+            # Определяем сколько обычных брать
+            num_items = random.randint(min_items, max_items)
+
+            if successful_normals:
+                selected = random.sample(
+                    successful_normals,
+                    min(num_items, len(successful_normals))
+                )
+
+                for entry, quantity in selected:
+                    roll_loot.extend(
+                        self._resolve_entry(entry, quantity)
+                    )
+
+            loot_results.extend(roll_loot)
 
         return loot_results
 
@@ -203,14 +292,44 @@ class LootTableManager:
     def get_table_entries(self, table_id):
         cursor = self.conn.cursor()
         cursor.execute('''
-            SELECT te.id, te.item_id, te.subtable_id, te.chance_percent,
-                   te.quantity_min, te.quantity_max,
+            SELECT te.id,
+                   te.item_id,
+                   te.subtable_id,
+                   te.chance_percent,
+                   te.quantity_min,
+                   te.quantity_max,
                    COALESCE(i.name, lt.name) as entry_name,
-                   CASE WHEN te.item_id IS NOT NULL THEN 'item' ELSE 'table' END as entry_type
+                   CASE 
+                       WHEN te.item_id IS NOT NULL THEN 'Item'
+                       ELSE 'Table'
+                   END as entry_type,
+                   te.is_unique,
+                   te.is_mandatory
             FROM table_entries te
             LEFT JOIN items i ON te.item_id = i.id
             LEFT JOIN loot_tables lt ON te.subtable_id = lt.id
             WHERE te.table_id = ?
-            ORDER BY te.chance_percent DESC
+            ORDER BY te.id
         ''', (table_id,))
         return cursor.fetchall()
+
+
+    def _resolve_entry(self, entry, quantity):
+        result = []
+
+        if entry["item_id"] and entry["item_name"]:
+            result.append({
+                "name": entry["item_name"],
+                "quantity": quantity
+            })
+
+        elif entry["subtable_id"] and entry["table_name"]:
+            sub_loot = self.generate_from_table(
+                entry["subtable_id"],
+                rolls=1,
+                min_items=1,
+                max_items=1
+            )
+            result.extend(sub_loot)
+
+        return result

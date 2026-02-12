@@ -3,6 +3,7 @@ from tkinter import ttk, messagebox, simpledialog, filedialog
 from collections import Counter
 import csv
 from settings.dictionary import _
+import random
 
 
 class LootTableApp:
@@ -122,8 +123,8 @@ class LootTableApp:
         ttk.Button(btn_frame2, text="Удалить запись",
                    command=self.remove_table_entry).pack(side='left', padx=2)
 
-        # Таблица записей
-        columns = ('ID', 'Тип', 'Название', 'Шанс%', 'Кол-во')
+        # Таблица записей с новыми колонками для галочек
+        columns = ('ID', 'Тип', 'Название', 'Шанс%', 'Кол-во', 'Уникальный', 'Обязательный')
         self.entries_tree = ttk.Treeview(right_frame, columns=columns, show='headings', height=10)
 
         for col in columns:
@@ -136,6 +137,9 @@ class LootTableApp:
 
         self.entries_tree.pack(fill='both', expand=True, padx=5, pady=5)
         scrollbar.pack(side='right', fill='y')
+
+        # Двойной клик для галочек
+        self.entries_tree.bind("<Double-1>", self.on_entry_double_click)
 
     def setup_containers_tab(self):
         main_frame = ttk.Frame(self.containers_tab)
@@ -380,7 +384,18 @@ class LootTableApp:
 
         entries = self.manager.get_table_entries(table_id)
         for entry in entries:
-            entry_id, item_id, subtable_id, chance, qty_min, qty_max, entry_name, entry_type = entry
+            (
+                entry_id,
+                item_id,
+                subtable_id,
+                chance,
+                qty_min,
+                qty_max,
+                entry_name,
+                entry_type,
+                is_unique,
+                is_mandatory
+            ) = entry
 
             if qty_min == qty_max:
                 quantity = str(qty_min)
@@ -388,7 +403,16 @@ class LootTableApp:
                 quantity = f"{qty_min}-{qty_max}"
 
             self.entries_tree.insert('', 'end',
-                                     values=(entry_id, entry_type, entry_name, f"{chance:.2f}%", quantity))
+                                     values=(
+                                         entry_id,
+                                         entry_type,
+                                         entry_name,
+                                         f"{chance:.2f}%",
+                                         f"{qty_min}-{qty_max}" if qty_min != qty_max else str(qty_min),
+                                         "✔" if is_unique else "",
+                                         "✔" if is_mandatory else ""
+                                     )
+                                     )
 
     def add_item_to_table_dialog(self):
         selection = self.tables_listbox.curselection()
@@ -449,6 +473,17 @@ class LootTableApp:
         qty_frame = ttk.Frame(settings_frame)
         qty_frame.grid(row=1, column=1, pady=5, sticky='w')
 
+        is_unique_var = tk.BooleanVar()
+        is_mandatory_var = tk.BooleanVar()
+
+        ttk.Checkbutton(settings_frame,
+                        text="Уникальный (1 за ролл)",
+                        variable=is_unique_var).grid(row=2, column=0, sticky='w')
+
+        ttk.Checkbutton(settings_frame,
+                        text="Обязательный",
+                        variable=is_mandatory_var).grid(row=2, column=1, sticky='w')
+
         qty_min_var = tk.IntVar(value=1)
         qty_max_var = tk.IntVar(value=1)
         ttk.Spinbox(qty_frame, from_=1, to=100, textvariable=qty_min_var, width=5).pack(side='left', padx=2)
@@ -468,10 +503,15 @@ class LootTableApp:
             if qty_min > qty_max:
                 messagebox.showerror("Ошибка", "Минимальное количество не может быть больше максимального")
                 return
-            self.manager.add_entry_to_table(table_id, item_id=item_id,
-                                            chance_percent=chance,
-                                            quantity_min=qty_min,
-                                            quantity_max=qty_max)
+            self.manager.add_entry_to_table(
+                table_id,
+                item_id=item_id,
+                chance_percent=chance,
+                quantity_min=qty_min,
+                quantity_max=qty_max,
+                is_unique=is_unique_var.get(),
+                is_mandatory=is_mandatory_var.get()
+            )
             self.on_table_select(None)
             dialog.destroy()
 
@@ -603,12 +643,19 @@ class LootTableApp:
         min_items = self.min_items_var.get()
         max_items = self.max_items_var.get()
 
-        loot = self.manager.generate_container_loot(container_id, rolls=rolls,
-                                                    min_items=min_items, max_items=max_items)
+        loot = self.manager.generate_container_loot(
+            container_id,
+            rolls=rolls,
+            min_items=min_items,
+            max_items=max_items
+        )
 
-        # Подсчет
-        from collections import Counter
-        loot_count = Counter(loot)
+        # агрегируем quantity
+        from collections import defaultdict
+        loot_count = defaultdict(int)
+
+        for item in loot:
+            loot_count[item["name"]] += item["quantity"]
 
         # Вывод
         self.quick_result_text.delete(1.0, tk.END)
@@ -621,7 +668,6 @@ class LootTableApp:
             if count > 1:
                 self.quick_result_text.insert(tk.END, f" (x{count})")
             self.quick_result_text.insert(tk.END, "\n")
-            total_items += count
 
         self.quick_result_text.insert(tk.END, f"\nВсего предметов: {total_items}\n")
 
@@ -745,7 +791,9 @@ class LootTableApp:
                     item_id=item_id,
                     chance_percent=chance,
                     quantity_min=qty_min,
-                    quantity_max=qty_max
+                    quantity_max=qty_max,
+                    is_unique=False,
+                    is_mandatory=False
                 )
 
         self.load_data()
@@ -823,3 +871,28 @@ class LootTableApp:
             dialog.destroy()
 
         ttk.Button(dialog, text="Сохранить", command=save_settings).pack(pady=20)
+
+    def on_entry_double_click(self, event):
+        item_id = self.entries_tree.identify_row(event.y)
+        if not item_id:
+            return
+
+        col = self.entries_tree.identify_column(event.x)
+        if col not in ('#6', '#7'):  # колонки "Уникальный" и "Обязательный"
+            return
+
+        current = self.entries_tree.set(item_id, col)
+        new_val = "✔" if current == "" else ""  # переключаем галочку
+        self.entries_tree.set(item_id, col, new_val)
+
+        # Сохраняем изменения в базе
+        entry_db_id = self.entries_tree.set(item_id, '#1')  # ID записи
+        is_unique = self.entries_tree.set(item_id, '#6') == "✔"
+        is_mandatory = self.entries_tree.set(item_id, '#7') == "✔"
+
+        cursor = self.manager.conn.cursor()
+        cursor.execute(
+            'UPDATE table_entries SET is_unique = ?, is_mandatory = ? WHERE id = ?',
+            (int(is_unique), int(is_mandatory), entry_db_id)
+        )
+        self.manager.conn.commit()
