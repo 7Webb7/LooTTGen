@@ -46,6 +46,7 @@ class LootTableApp:
         self.generate_tab = ttk.Frame(tab_control)
         tab_control.add(self.generate_tab, text='Генерация')
         self.setup_generate_tab()
+        tab_control.forget(self.generate_tab)
 
         tab_control.pack(expand=1, fill='both')
 
