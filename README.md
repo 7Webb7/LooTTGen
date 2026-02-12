@@ -37,5 +37,6 @@
 - SQLite
 
 ## Запуск
+
 ```bash
 python main.py
